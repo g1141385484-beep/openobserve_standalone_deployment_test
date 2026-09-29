@@ -2,9 +2,9 @@
 
 
 ## 2.使用docker-compose或者podman-compose启动项目
-、、、
+```
 docker-compose -f docker-compose.yml up -d
-、、、
+```
 
 
 
