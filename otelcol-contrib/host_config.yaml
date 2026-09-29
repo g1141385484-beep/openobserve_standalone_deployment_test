@@ -41,7 +41,7 @@ service:
     logs:
       level: warn
   pipelines:
-    metrics:
+    metrics/hosts:
       receivers: [host_metrics,host_metrics/disk]
       processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
       exporters: [otlp_http/otelcol]

@@ -251,7 +251,7 @@ exporters:
 
 service:
   pipelines:
-    logs:
+    logs/mysql:
       receivers: [sqlquery/mysql_locks, filelog/mysql_deadlocks, sqlquery/mysql_table_stats, sqlquery/mysql_index_stats]
       # memory_limiter FIRST — it back-pressures what is upstream of it, so
       # anything listed before it runs outside the guard.

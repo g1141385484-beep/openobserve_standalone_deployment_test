@@ -40,7 +40,7 @@ service:
     logs:
       level: warn
   pipelines:
-    metrics:
+    metrics/mysql:
       receivers: [mysql, sqlquery/mysql_limits]
       processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
       exporters: [otlp_http/otelcol]
