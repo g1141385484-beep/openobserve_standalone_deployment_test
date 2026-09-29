@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:latest
+    container_name: openobserve
+    ports:
+      - "5080:5080"    # UI + OTLP HTTP
+      - "5081:5081"    # OTLP gRPC
+    environment:
+      ZO_ROOT_USER_EMAIL: "root@example.com"
+      ZO_ROOT_USER_PASSWORD: "Complexpass#123"
+      ZO_DATA_DIR: "/data"
+    volumes:
+      - /data/openobserve:/data
+    restart: unless-stopped
+
+  mysql:
+    image: docker.io/library/mysql:5.7.44
+    container_name: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: Hzdk@123
+      MYSQL_DATABASE: tracingdb
+    volumes:
+      - /data/mysql/data:/var/lib/mysql
+      -  /data/mysql/logs:/var/log/mysql
+      -  /data/mysql/conf/my.cnf:/etc/mysql/my.cnf
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  nginx:
+    image: docker.io/library/nginx:latest
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "8084:8084"
+    volumes:
+      - /data/nginx/nginx:/etc/nginx
+      - /data/nginx/logs:/var/log/nginx
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime
+    command: ["nginx", "-g", "daemon off;"]
+
+
+
+   
