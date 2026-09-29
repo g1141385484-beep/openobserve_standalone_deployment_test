@@ -1,0 +1,47 @@
+receivers:
+  # 1. 采集本机系统指标（CPU、内存等）
+  host_metrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      load:
+      network:
+      processes:
+      system:
+
+  host_metrics/disk:
+    collection_interval: 1m
+    scrapers:
+      disk:
+      filesystem:
+
+processors:
+  # 建议加上批处理，减少对后端的请求次数
+  batch: {}
+  #给收集到的指标添加主机标签  
+  resource_detection/system:
+    detectors: ["system"]
+    system:
+      hostname_sources: ["os"]
+    timeout: 5s                # 探测超时时间
+    override: false            # 不覆盖数据中已有的 host.name 属性
+  # 如果你在容器内运行，可能需要 memory_limiter 防止 OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 1000
+    spike_limit_mib: 200
+
+exporters:
+  otlp_http/otelcol:
+    endpoint: http://192.168.223.110:4318
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [host_metrics,host_metrics/disk]
+      processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]

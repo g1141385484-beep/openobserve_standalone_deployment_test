@@ -1,0 +1,46 @@
+receivers:
+  mysql:
+    endpoint: "192.168.223.110:3306"
+    username: otel
+    password: Hzdk@123
+    database: otel
+    collection_interval: 10s
+    initial_delay: 1s
+
+  sqlquery/mysql_limits:
+    driver: mysql
+    datasource: "otel:Hzdk@123@tcp(192.168.223.110:3306)/mysql"
+    collection_interval: 60s
+    queries:
+      - sql: "SELECT @@max_connections AS max_connections, '192.168.223.110:3306' AS mysql_instance_endpoint"
+        metrics:
+          - metric_name: mysql.connection.max
+            value_column: max_connections
+            attribute_columns: [mysql_instance_endpoint]
+            value_type: int
+            data_type: gauge
+
+processors:
+  # 建议加上批处理，减少对后端的请求次数
+  batch: {}
+  #给收集到的指标添加主机标签  
+  resource_detection/system:
+    detectors: ["system"]
+    system:
+      hostname_sources: ["os"]
+    timeout: 5s                # 探测超时时间
+    override: false            # 不覆盖数据中已有的 host.name 属性
+
+exporters:
+  otlp_http/otelcol:
+    endpoint: http://192.168.223.110:4318
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [mysql, sqlquery/mysql_limits]
+      processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]

@@ -1,0 +1,74 @@
+receivers:
+  nginx:
+    endpoint: "http://192.168.223.111:8080/status"
+    collection_interval: 10s
+
+ # 采集 Nginx 访问日志
+  file_log/nginx_access:
+    include: [ /data/nginx/logs/host.access.log ]
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+      - type: time_parser
+        parse_from: attributes.time_local
+        layout: '%d/%b/%Y:%H:%M:%S %z'
+      - type: add
+        field: attributes.source
+        value: "nginx"
+
+  # 采集 Nginx 错误日志
+  file_log/nginx_error:
+    include: [ /data/nginx/logs/error.log ]
+    start_at: end
+    include_file_path: true
+    # ✅ 正确写法：multiline 是接收器的顶级字段
+    multiline:
+      line_start_pattern: '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'
+    operators:
+      - type: regex_parser
+        regex: '^(?P<time>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<pid>\d+)#(?P<tid>\d+): (?P<message>.*)'
+        timestamp:
+          parse_from: attributes.time
+          layout: '%Y/%m/%d %H:%M:%S'
+
+  prometheus/nginx:
+    config:
+      scrape_configs:
+        - job_name: 'nginx'
+          scrape_interval: 30s
+          static_configs:
+            # 如果 exporter 在另一台机器上，将 localhost 替换为实际 IP
+            - targets: ['localhost:9113'] 
+
+processors:
+  # 建议加上批处理，减少对后端的请求次数
+  batch: {}
+  #给收集到的指标添加主机标签  
+  resource_detection/system:
+    detectors: ["system"]
+    system:
+      hostname_sources: ["os"]
+    timeout: 5s                # 探测超时时间
+    override: false            # 不覆盖数据中已有的 host.name 属性
+
+exporters:
+
+  otlp_http/otelcol:
+    endpoint: http://192.168.223.110:4318
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [prometheus/nginx]
+      processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]
+    logs:
+      receivers: [file_log/nginx_access,file_log/nginx_error]
+      processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]

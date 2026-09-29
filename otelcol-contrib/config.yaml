@@ -1,1 +1,139 @@
+receivers:
+  # 1. 采集本机系统指标（CPU、内存等）
+  host_metrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      load:
+      network:
+      processes:
+      system:
 
+  host_metrics/disk:
+    collection_interval: 1m
+    scrapers:
+      disk:
+      filesystem:
+  nginx:
+    endpoint: "http://192.168.223.111:8080/status"
+    collection_interval: 10s
+
+ # 采集 Nginx 访问日志
+  file_log/nginx_access:
+    include: [ /data/nginx/logs/host.access.log ]
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+      - type: time_parser
+        parse_from: attributes.time_local
+        layout: '%d/%b/%Y:%H:%M:%S %z'
+      - type: add
+        field: attributes.source
+        value: "nginx"
+
+  # 采集 Nginx 错误日志
+  file_log/nginx_error:
+    include: [ /data/nginx/logs/error.log ]
+    start_at: end
+    include_file_path: true
+    # ✅ 正确写法：multiline 是接收器的顶级字段
+    multiline:
+      line_start_pattern: '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'
+    operators:
+      - type: regex_parser
+        regex: '^(?P<time>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<pid>\d+)#(?P<tid>\d+): (?P<message>.*)'
+        timestamp:
+          parse_from: attributes.time
+          layout: '%Y/%m/%d %H:%M:%S'
+
+  prometheus/nginx:
+    config:
+      scrape_configs:
+        - job_name: 'nginx'
+          scrape_interval: 30s
+          static_configs:
+            # 如果 exporter 在另一台机器上，将 localhost 替换为实际 IP
+            - targets: ['localhost:9113'] 
+
+
+  mysql:
+    endpoint: "192.168.223.110:3306"
+    username: otel
+    password: Hzdk@123
+    database: otel
+    collection_interval: 10s
+    initial_delay: 1s
+
+  sqlquery/mysql_limits:
+    driver: mysql
+    datasource: "otel:Hzdk@123@tcp(192.168.223.110:3306)/mysql"
+    collection_interval: 60s
+    queries:
+      - sql: "SELECT @@max_connections AS max_connections, '192.168.223.110:3306' AS mysql_instance_endpoint"
+        metrics:
+          - metric_name: mysql.connection.max
+            value_column: max_connections
+            attribute_columns: [mysql_instance_endpoint]
+            value_type: int
+            data_type: gauge
+  # 2. 接收其他 Collector 推送过来的数据
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 建议加上批处理，减少对后端的请求次数
+  batch: {}
+  #给收集到的指标添加主机标签  
+  resource_detection/system:
+    detectors: ["system"]
+    system:
+      hostname_sources: ["os"]
+    timeout: 5s                # 探测超时时间
+    override: false            # 不覆盖数据中已有的 host.name 属性
+  # 如果你在容器内运行，可能需要 memory_limiter 防止 OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 1000
+    spike_limit_mib: 200
+
+exporters:
+  # 3. 导出到 OpenObserve
+  otlp/openobserve:
+    # 注意：这里的 endpoint 只写到 /api/<organization>，不要加 /v1/metrics 等后缀
+    endpoint: 192.168.223.110:5081
+    headers:
+      Authorization: "Basic cm9vdEBleGFtcGxlLmNvbTpvMm9pX2t5eWxRNkZ6c1VucXQ1Tld5NUQ5MXZLd1p6Sjc4RWdy"
+      organization: "_meta"
+      stream-name: "default"
+    tls:
+      insecure: true # 如果 OpenObserve 是 HTTP 或者使用自签名证书，可能需要此项
+
+  otlp_http/openobserve:
+    endpoint: http://192.168.223.110:5080/api/_meta
+    headers:
+      Authorization: Basic cm9vdEBleGFtcGxlLmNvbTpvMm9pX2t5eWxRNkZ6c1VucXQ1Tld5NUQ5MXZLd1p6Sjc4RWdy
+      stream-name: default
+  otlp_http/otelcol:
+    endpoint: http://192.168.223.110:4318
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [host_metrics,host_metrics/disk,mysql, sqlquery/mysql_limits,prometheus/nginx]
+      processors: [memory_limiter, batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]
+    logs:
+      receivers: [file_log/nginx_access,file_log/nginx_error]
+      processors: [batch,resource_detection/system] # 建议 memory_limiter 放在最前
+      exporters: [otlp_http/otelcol]

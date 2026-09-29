@@ -1,0 +1,263 @@
+receivers:
+  sqlquery/mysql_locks:
+    driver: mysql
+    datasource: "otel:Hzdk@123@tcp(192.168.223.110:3306)/mysql"
+    collection_interval: 10s
+    # max_open_conn is SINGULAR; the plural is an unknown key that is
+    # silently ignored, and unset means unlimited.
+    max_open_conn: 2
+    queries:
+      - sql: |
+          SELECT CAST(w.REQUESTING_ENGINE_TRANSACTION_ID AS CHAR) AS waiting_trx,
+                 -- PER-SESSION database, from PROCESSLIST joined on the
+                 -- transaction's thread id. innodb_trx has NO database column
+                 -- of its own, so the waiting session's current schema is the
+                 -- only per-row database this source can supply.
+                 COALESCE(rp.DB, '')                              AS my_db,
+                 CAST(w.BLOCKING_ENGINE_TRANSACTION_ID AS CHAR)   AS blocking_trx,
+                 COALESCE(rt.trx_mysql_thread_id, 0)              AS waiting_thread,
+                 COALESCE(bt.trx_mysql_thread_id, 0)              AS blocking_thread,
+                 COALESCE(LEFT(rt.trx_query,500), '')             AS waiting_query,
+                 COALESCE(LEFT(bt.trx_query,500), '')             AS blocking_query,
+                 COALESCE(rt.trx_state,'')                        AS waiting_state,
+                 COALESCE(bt.trx_state,'')                        AS blocking_state,
+                 CAST(COALESCE(TIMESTAMPDIFF(SECOND, rt.trx_wait_started, NOW()),0) AS CHAR) AS wait_secs,
+                 'localhost'                                         AS server_address,
+                 'mysql_lock_waits'                               AS o2_recipe
+          FROM performance_schema.data_lock_waits w
+          LEFT JOIN information_schema.innodb_trx rt
+                 ON rt.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID
+          LEFT JOIN information_schema.innodb_trx bt
+                 ON bt.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID
+          LEFT JOIN information_schema.PROCESSLIST rp
+                 ON rp.ID = rt.trx_mysql_thread_id
+        logs:
+          - body_column: waiting_query
+            attribute_columns:
+              [waiting_trx, blocking_trx, my_db, waiting_thread, blocking_thread,
+               blocking_query, waiting_state, blocking_state, wait_secs, server_address, o2_recipe]
+  filelog/mysql_deadlocks:
+    include: [/data/mysql/logs/error.log]
+    start_at: end
+    multiline:
+      line_start_pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}'
+    operators:
+      - type: regex_parser
+        regex: '^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z) (?P<my_thread>\d+) \[(?P<my_severity>\w+)\] \[(?P<my_code>[^\]]+)\] \[(?P<my_subsys>[^\]]+)\] (?P<my_message>(?s).*)$'
+        on_error: send
+        timestamp:
+          parse_from: attributes.ts
+          layout: "%Y-%m-%dT%H:%M:%S.%fZ"
+      - type: add
+        field: attributes.o2_my_event
+        value: other
+      # IDENTITY. Without this every host reporting into _o2_dbm_server looks like
+      # the same server: the read-time deadlock stitch groups on
+      # (engine, instance, database), so untagged sides from two different hosts
+      # could fuse into one fabricated multi-participant deadlock.
+      - type: add
+        field: attributes.server_address
+        value: "localhost"
+      - type: router
+        routes:
+          - expr: 'attributes.my_code == "MY-012468" or attributes.my_code == "MY-012469"'
+            output: my_dl
+          # Anchored on the markers InnoDB actually writes, NOT on the word
+          # "deadlock": a bare substring stamps ordinary notes that merely
+          # mention it (e.g. "deadlock avoidance is deprecated") as deadlocks
+          # carrying no transaction, query or victim.
+          - expr: 'attributes.my_message != nil and attributes.my_message matches "TRANSACTION|Transactions deadlock detected|WE ROLL BACK TRANSACTION"'
+            output: my_dl
+        default: my_emit
+      - type: add
+        id: my_dl
+        field: attributes.o2_my_event
+        value: deadlock
+      - type: regex_parser
+        parse_from: attributes.my_message
+        regex: '(?s)\*\*\* \((?P<my_trx_side>\d+)\) TRANSACTION:\s*\nTRANSACTION (?P<my_trx_id>\d+).*?MySQL thread id (?P<my_trx_thread>\d+),[^\n]*?query id \d+ (?P<my_trx_host>\S+) (?P<my_trx_user>\S+)[^\n]*\n(?P<my_trx_query>[^\n]+)'
+        on_error: send
+      - type: regex_parser
+        parse_from: attributes.my_message
+        # my_db is captured from the SCHEMA HALF of the qualified table name:
+        # InnoDB writes the locked object as db.table, and this is the ONLY
+        # place the MySQL error log states the database. detect_database reads
+        # my_db.
+        #
+        # THIS IS A DIFFERENT RECORD FROM THE PARTICIPANT, which is why the two
+        # extra captures exist. `line_start_pattern` splits on the timestamp, so
+        # the RECORD LOCKS line can never share a record with the
+        # `*** (N) TRANSACTION:` block above it. `my_lock_side` and
+        # `my_lock_trx_id` are what make the two joinable at merge time --
+        # without them the lock detail is thrown away and the database comes
+        # back null, so the Deadlocks tab's `?database=` filter cannot work.
+        regex: '(?s)\*\*\* \((?P<my_lock_side>\d+)\) (?:HOLDS THE LOCK|WAITING FOR THIS LOCK).*?RECORD LOCKS space id \d+ page no \d+ n bits \d+ index (?P<my_lock_index>\S+) of table (?P<my_lock_table>`?(?P<my_db>[^`. ]+)`?\.\S+) trx id (?P<my_lock_trx_id>\d+) (?P<my_lock_mode>lock_mode \S+)'
+        on_error: send
+      - type: regex_parser
+        parse_from: attributes.my_message
+        regex: '\*\*\* WE ROLL BACK TRANSACTION \((?P<my_victim_side>\d+)\)'
+        on_error: send
+        output: my_emit
+      - type: noop
+        id: my_emit
+  sqlquery/mysql_table_stats:
+    driver: mysql
+    datasource: "otel:Hzdk@123@tcp(192.168.223.110:3306)/mysql"
+    collection_interval: 60s
+    # max_open_conn is SINGULAR; the plural is an unknown key that is
+    # silently ignored, and unset means unlimited.
+    max_open_conn: 2
+    queries:
+      - sql: |
+          SELECT t.TABLE_SCHEMA                                        AS schema_name,
+                 t.TABLE_NAME                                          AS table_name,
+                 CAST(COALESCE(t.DATA_LENGTH,0) + COALESCE(t.INDEX_LENGTH,0) AS CHAR) AS total_bytes,
+                 CAST(COALESCE(t.DATA_LENGTH,0) AS CHAR)               AS heap_bytes,
+                 CAST(COALESCE(s.n_rows, t.TABLE_ROWS, 0) AS CHAR)     AS n_live_tup,
+                 COALESCE(CAST(s.last_update AS CHAR), '')             AS last_analyze,
+                 'localhost'                                              AS server_address,
+                 'mysql_table_stats'                                   AS o2_recipe
+          FROM information_schema.TABLES t
+          LEFT JOIN mysql.innodb_table_stats s
+                 ON s.database_name = t.TABLE_SCHEMA AND s.table_name = t.TABLE_NAME
+          WHERE t.TABLE_TYPE = 'BASE TABLE'
+            AND t.TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')
+        logs:
+          - body_column: table_name
+            attribute_columns:
+              [schema_name, total_bytes, heap_bytes, n_live_tup, last_analyze,
+               server_address, o2_recipe]
+  sqlquery/mysql_index_stats:
+    driver: mysql
+    datasource: "otel:Hzdk@123@tcp(192.168.223.110:3306)/mysql"
+    collection_interval: 60s
+    # max_open_conn is SINGULAR; the plural is an unknown key that is
+    # silently ignored, and unset means unlimited.
+    max_open_conn: 2
+    queries:
+      - sql: |
+          SELECT st.TABLE_SCHEMA                                       AS schema_name,
+                 st.TABLE_NAME                                         AS table_name,
+                 st.INDEX_NAME                                         AS index_name,
+                 CAST(COALESCE(io.COUNT_READ, 0) AS CHAR)              AS idx_scan,
+                 CAST(COALESCE(sz.stat_value, 0) * @@innodb_page_size AS CHAR) AS index_bytes,
+                 CASE WHEN MIN(st.NON_UNIQUE) = 0 THEN 'true' ELSE 'false' END AS is_unique,
+                 CONCAT('INDEX ', st.INDEX_NAME, ' ON ', st.TABLE_SCHEMA, '.', st.TABLE_NAME,
+                        ' (', GROUP_CONCAT(COALESCE(st.COLUMN_NAME, CONCAT('(', st.EXPRESSION, ')'))
+                                           ORDER BY st.SEQ_IN_INDEX SEPARATOR ', '), ')') AS index_def,
+                 'localhost'                                              AS server_address,
+                 'mysql_index_stats'                                   AS o2_recipe
+          FROM information_schema.STATISTICS st
+          LEFT JOIN performance_schema.table_io_waits_summary_by_index_usage io
+                 ON io.OBJECT_SCHEMA = st.TABLE_SCHEMA AND io.OBJECT_NAME = st.TABLE_NAME
+                AND io.INDEX_NAME = st.INDEX_NAME
+          LEFT JOIN mysql.innodb_index_stats sz
+                 ON sz.database_name = st.TABLE_SCHEMA AND sz.table_name = st.TABLE_NAME
+                AND sz.index_name = st.INDEX_NAME AND sz.stat_name = 'size'
+          WHERE st.TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')
+          GROUP BY st.TABLE_SCHEMA, st.TABLE_NAME, st.INDEX_NAME, io.COUNT_READ, sz.stat_value
+        logs:
+          - body_column: index_def
+            attribute_columns:
+              [schema_name, table_name, index_name, idx_scan, index_bytes,
+               is_unique, server_address, o2_recipe]
+  mysql/dbm_events:
+    endpoint: "192.168.223.110:3306"
+    username: otel
+    password: Hzdk@123
+    database: mysql
+    collection_interval: 10s
+    query_sample_collection:
+      # mysqlreceiver's OWN default -- NOT Postgres's 1000; the two receivers
+      # diverge deliberately (see the spelling asymmetry noted above).
+      max_rows_per_query: 100
+    top_query_collection:
+      top_query_count: 200
+      # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s -- the same
+      # call the Postgres receiver makes. It multiplies every per-cycle cost,
+      # so an "align with upstream" pass must not revert it silently alongside
+      # the block's other knobs.
+      collection_interval: 15s
+      lookback_time: 120
+      query_plan_cache_size: 1000
+    # ON. These two events fill the Activity tab and the server-side Top
+    # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+    # this block the collector looks healthy and emits ZERO events. Set one to
+    # false to trim cost, but the block itself must STAY -- and events: must
+    # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+    events:
+      db.server.query_sample: { enabled: true }
+      db.server.top_query: { enabled: true }
+
+processors:
+  # Keep ONLY the records the Database Monitoring pages read. Load-bearing, not
+  # tidiness: the filelog receivers tail the WHOLE database log, so without
+  # this every ordinary log line lands in _o2_dbm_server too and swamps the tagged
+  # rows. A record is ours if a recipe tagged it -- sqlquery rows carry
+  # o2_recipe, filelog rows carry o2_pg_event / o2_my_event / o2_maria_event.
+  filter/dbm:
+    error_mode: ignore
+    logs:
+      log_record:
+        # Tests the VALUE, not just presence. Every filelog pipeline stamps its
+        # o2_*_event = "other" on EVERY line before routing (so the router has a
+        # default), which means a nil-check keeps the whole error log — the exact
+        # noise this filter exists to drop. Only the classified events, and the
+        # sqlquery recipes' o2_recipe rows, are ours.
+        #
+        # o2_maria_event MUST be listed here. It is a separate key from
+        # o2_my_event by design (see MARIADB_DEADLOG_RECEIVER), so omitting it
+        # would drop every MariaDB deadlock while the pipeline looked healthy.
+        - 'attributes["o2_recipe"] == nil and (attributes["o2_pg_event"] == nil or attributes["o2_pg_event"] == "other") and (attributes["o2_my_event"] == nil or attributes["o2_my_event"] == "other") and (attributes["o2_maria_event"] == nil or attributes["o2_maria_event"] == "other")'
+  # SELF-PROTECTION. This collector usually runs on the CUSTOMER'S DATABASE
+  # HOST: the filelog receivers read the database log as fast as it grows, so
+  # with nothing between them and a stalled exporter the heap absorbs the
+  # difference until the OOM killer ends it -- and the stall is most likely
+  # during exactly the incident that produced the volume.
+  #
+  # MUST BE FIRST in every pipeline's processors list: memory_limiter applies
+  # back-pressure to whatever is UPSTREAM of it, so a processor listed before
+  # it is outside the guard. When over the soft limit it refuses batches, which
+  # propagates back into the receivers and makes the collector SHED rather than
+  # grow.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 768
+    spike_limit_mib: 192
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlphttp/openobserve_dbm:
+    logs_endpoint: http://192.168.223.110:5080/api/_meta/v1/logs
+    headers:
+      Authorization: Basic cm9vdEBleGFtcGxlLmNvbTpvMm9pX2t5eWxRNkZ6c1VucXQ1Tld5NUQ5MXZLd1p6Sjc4RWdy
+      stream-name: _o2_dbm_server
+    # THE OTHER HALF OF THE OOM GUARD (see memory_limiter above). Left at its
+    # defaults the sending queue is effectively an unbounded in-memory buffer,
+    # and retry_on_failure with no deadline re-queues batches that will never
+    # succeed. Beyond the queue the collector DROPS, which is correct here: a
+    # gap in the Deadlocks timeline beats a dead collector on a database host.
+    # The queue is IN MEMORY and deliberately not persistent -- persistence
+    # needs a storage: extension and a writable state directory on the database
+    # host.
+    sending_queue:
+      enabled: true
+      queue_size: 500
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+
+service:
+  pipelines:
+    logs:
+      receivers: [sqlquery/mysql_locks, filelog/mysql_deadlocks, sqlquery/mysql_table_stats, sqlquery/mysql_index_stats]
+      # memory_limiter FIRST — it back-pressures what is upstream of it, so
+      # anything listed before it runs outside the guard.
+      processors: [memory_limiter, filter/dbm, batch]
+      exporters: [otlphttp/openobserve_dbm]
+    logs/dbm_events:
+      receivers: [mysql/dbm_events]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/openobserve_dbm]
