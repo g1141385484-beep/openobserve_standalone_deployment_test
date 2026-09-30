@@ -27,7 +27,7 @@ web页地址：http://localhost:5080
 ```
   systemctl restart otelcol-contrib
   ```
-## 4.java-distributed-tracing-main下java服务的使用  
+## 5.java-distributed-tracing-main下java服务的使用  
   需要根据本地部署情况修改start.sh中OTEL_EXPORTER_OTLP_HEADERS配置项
   
 cd 到对应服务目录下 使用./scripts/start.sh 启动。需要先启动discovery-service注册服务
@@ -44,7 +44,7 @@ cd java-distributed-tracing-main/order-service
 | payment-service | 8083 |
 | discovery-service| 8761 |
 
-## 5.调用方式
+## 6.调用方式
 
 ```
 #新增订单
@@ -72,7 +72,9 @@ curl -X POST http://localhost:8081/api/users \
 
 ```
   
-
+## 7.验证
+<img width="1885" height="945" alt="image" src="https://github.com/user-attachments/assets/4f456f47-c0f4-4dfa-91a5-30d0d4121f4d" />
+可以在openobserve的数据流中查看是否有最新的数据接入
   
 
 
