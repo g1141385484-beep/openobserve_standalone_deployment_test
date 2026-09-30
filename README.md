@@ -44,6 +44,17 @@ curl -X POST http://localhost:8082/api/orders \
     "totalAmount": 100
   }'
 
+#获取用户列表
+curl -X GET http://localhost:8081/api/users
+#新建用户
+curl -X POST http://localhost:8081/api/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "zhangsan",
+    "email": "123@qq.com",
+    "phone": "12345678901"
+  }'
+
 
 ```
   
